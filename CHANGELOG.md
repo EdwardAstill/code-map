@@ -4,6 +4,22 @@ All notable changes to `code-map` will be documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.1] — 2026-05-06
+
+### Changed
+
+- `code-map query 'blast-radius <sym>' --depth` default lowered from 5 to 3.
+  Per RepoGraph (ICLR 2025): 1-hop ego-graphs already contain comprehensive
+  information; 2-hop expansion costs ~5× tokens for worse downstream resolve
+  rate. `--depth 5+` is still available; the new default just stops surprising
+  agents with context bloat.
+- `--map-tokens` now accepts presets: `small` (1 500), `medium` (4 000,
+  default — same as before), `full` (effectively uncapped), or any integer.
+
+### Notes
+
+- No new subcommands or breaking schema changes. CLI surface count stays at 10.
+
 ## [v0.2.0] — 2026-05-06
 
 ### Added

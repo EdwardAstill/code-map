@@ -16,6 +16,28 @@ app = typer.Typer(
 )
 
 
+# Token-budget presets for `--map-tokens`. Names map to int; passing an int via
+# the flag still works directly. Research: RepoGraph 1-hop (~2.3 K tokens) often
+# outperforms 2-hop (~10.5 K), so smaller is usually better than larger.
+_MAP_TOKEN_PRESETS = {
+    "small": 1500,
+    "medium": 4000,
+    "full": 1_000_000_000,  # effectively uncapped
+}
+
+
+def _resolve_map_tokens(value: str) -> int:
+    """Translate `--map-tokens small|medium|full|<int>` to an int."""
+    if value in _MAP_TOKEN_PRESETS:
+        return _MAP_TOKEN_PRESETS[value]
+    try:
+        return int(value)
+    except ValueError as e:
+        raise typer.BadParameter(
+            f"--map-tokens must be one of {sorted(_MAP_TOKEN_PRESETS)} or an integer; got {value!r}"
+        ) from e
+
+
 def _run() -> None:
     """Console-script entry point (see [project.scripts] in pyproject.toml)."""
     app()
@@ -28,11 +50,14 @@ def _run() -> None:
 def build(
     repo: str = typer.Option(".", "--repo", help="Repo root to index."),
     lang: str = typer.Option("python,typescript,rust", "--lang", help="Comma-separated language list."),
-    map_tokens: int = typer.Option(4000, "--map-tokens", help="Token budget for MAP.md."),
+    map_tokens: str = typer.Option(
+        "medium", "--map-tokens",
+        help="Token budget for MAP.md: small (1.5K) | medium (4K, default) | full (uncapped) | <int>.",
+    ),
 ):
     """Full code-map build."""
     from code_map.runner import run_build
-    run_build(repo=repo, languages=tuple(lang.split(",")), map_tokens=map_tokens)
+    run_build(repo=repo, languages=tuple(lang.split(",")), map_tokens=_resolve_map_tokens(map_tokens))
 
 
 @app.command()
@@ -48,11 +73,14 @@ def refresh(
 @app.command()
 def render(
     repo: str = typer.Option(".", "--repo", help="Repo root (defaults to cwd)."),
-    map_tokens: int = typer.Option(4000, "--map-tokens", help="Token budget for MAP.md."),
+    map_tokens: str = typer.Option(
+        "medium", "--map-tokens",
+        help="Token budget for MAP.md: small (1.5K) | medium (4K, default) | full (uncapped) | <int>.",
+    ),
 ):
     """Re-derive MAP.md and packages/*.md from graph.db."""
     from code_map.render import run_render
-    run_render(repo=repo, map_tokens=map_tokens)
+    run_render(repo=repo, map_tokens=_resolve_map_tokens(map_tokens))
 
 
 # ── Read-only queries ─────────────────────────────────────────────────────────
@@ -61,7 +89,7 @@ def render(
 @app.command()
 def query(
     expression: str = typer.Argument(..., help="Query expression: callers-of <sym>, callees-of <sym>, blast-radius <sym> [--depth N], defined-in <file>. Symbol globs (* and ?) are honoured."),
-    depth: int = typer.Option(5, "--depth", help="Depth limit for blast-radius."),
+    depth: int = typer.Option(3, "--depth", help="Depth limit for blast-radius. Default 3 — RepoGraph (ICLR 2025) shows 1-hop often beats N-hop; use --depth 5+ only when needed."),
     fmt: str = typer.Option("json", "--format", help="Output format: json (default, machine-parseable) or markdown (prompt-paste-ready)."),
     limit: int = typer.Option(50, "--limit", help="Max results (capped at 100 unless --no-limit)."),
     no_limit: bool = typer.Option(False, "--no-limit", help="Disable result cap."),
