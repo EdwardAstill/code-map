@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+
+      - name: Sync dependencies
+        run: uv sync --python ${{ matrix.python }}
+
+      - name: Lint (ruff check)
+        run: uv tool run ruff check src/ tests/
+
+      - name: Format check (ruff format --check)
+        run: uv tool run ruff format --check src/ tests/
+
+      - name: Tests (excluding slow perf gate)
+        run: uv run pytest tests/ -v --ignore=tests/test_query_perf.py
+
+      - name: Smoke test the installed CLI
+        run: |
+          uv run code-map --help
+          uv run code-map schema | python -c "import sys, json; doc = json.load(sys.stdin); assert '\$schema' in doc and 'draft/2020-12' in doc['\$schema']"
