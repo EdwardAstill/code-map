@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+.coverage
+htmlcov/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# Code-map artifact (output, not source)
+.code-map/
+.warden/
+
+# OS
+.DS_Store

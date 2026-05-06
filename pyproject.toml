@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "code-map"
+version = "0.1.0"
+description = "AI-consumable code-map artifact: SQLite + JSONL + token-budgeted markdown for polyglot repos via tree-sitter."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Edward Astill", email = "edwardast.ll@gmail.com" }]
+dependencies = [
+    "typer>=0.12",
+    "tree_sitter>=0.23",
+    "tree_sitter_python>=0.23",
+    "tree_sitter_typescript>=0.23",
+    "tree_sitter_rust>=0.23",
+    "networkx>=3.3",
+    "tiktoken>=0.7",
+]
+
+[project.urls]
+Repository = "https://github.com/EdwardAstill/code-map"
+
+[project.scripts]
+code-map = "code_map.cli:_run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/code_map"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: long-running tests (e.g. perf gates against large repos)",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+]
