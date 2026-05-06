@@ -4,6 +4,80 @@ All notable changes to `code-map` will be documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.0] — 2026-05-06
+
+Surfaced by dogfooding v0.2.1 on a 276-file polyglot repo (warden). All five
+fixes are extractor / runner correctness — no schema or CLI surface change.
+
+### Fixed
+
+- **Refresh now garbage-collects rows for files deleted from disk.** Prior to
+  this release, deleting a file left orphaned `files` / `symbols` / `edges`
+  rows behind, and `code-map status` reported `stale: true` permanently
+  (`files_missing_since_build` never dropped). `refresh` now diffs the manifest
+  against the current walk and removes stale rows; the JSON summary gains a
+  new `files_removed` field.
+- **`inherits` and `implements` edges are now emitted.** v0.2.x DBs contained
+  only `calls` edges (1382/1382 on warden) — the schema declared 5 kinds but
+  4 of them were unimplemented. Now:
+  - **Python**: `class Child(Parent):` → `Child --inherits--> Parent`.
+    Multiple bases supported. Dotted bases (`pkg.Base`) resolve by rightmost
+    name.
+  - **TypeScript**: `class C extends B implements I, J { … }` →
+    one `inherits` and N `implements` edges. Interfaces are now indexed as
+    symbols (kind=class) so they resolve as edge targets.
+  - **Rust**: `impl Trait for Type { … }` → `Type --implements--> Trait`.
+    Inherent impls (`impl Type { … }`) emit no edge.
+  Cross-file resolution is name-only and demoted to `certainty=probable`;
+  ambiguous matches are dropped rather than guessed.
+- **Python method extraction undercount.** v0.2.x emitted ~1 method per ~6
+  classes (12 / 69 on warden) because `function_definition` captures fired
+  before `method_definition`, then the `(name, line_start)` dedup dropped
+  the method capture. Method captures now process first; methods correctly
+  carry `kind=method` and `qualified_name=<module>.<Class>.<method>`.
+- **Python import resolution for nested-package layouts.** The flat-only
+  resolver missed `from warden import plan_exec` against
+  `core/tools/python/src/warden/plan_exec.py`. Three-strategy resolver
+  added: flat → `src/`-style → unique basename match across the repo
+  (skip-dirs respected). Ambiguous matches still drop.
+- **Submodule from-imports resolve.** `from pkg.sub import mod` where
+  `pkg/sub/mod.py` is a submodule now emits a module-level edge to
+  `mod.py` instead of a name-import to `__init__.py` that would never
+  resolve.
+- **PageRank degeneracy.** v0.2.x DBs had every file at `pagerank=1.0`
+  because no import edges were extracted (resolver miss + `<module>`
+  symbols not synthesized). With imports actually landing in the DB,
+  PageRank now distinguishes hub files from leaf files.
+
+### Added
+
+- **Synthetic `<module>` symbol per file** — needed so module-level edges
+  (`import os`, submodule imports, wildcard imports) can resolve to a
+  symbol ID rather than being silently dropped at persistence time.
+- **`code-map find --kind module`** now works as a side-effect.
+
+### Changed
+
+- **`callers-of` / `callees-of` / `blast-radius` now include `inherits` and
+  `implements` edges**, not only `calls` / `references`. Previously asking
+  "what depends on `BaseNode`?" returned `[]` even when 5 subclasses inherited
+  from it, because the type-relationship edges were excluded from the
+  dependency view. Static-analysis dependents are dependents — the verbs now
+  treat them uniformly.
+- **Default skip-dirs expanded** to cover `dist`, `build`, `venv`, `.env`,
+  `.warden`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`,
+  `.next`, `.nuxt`, `.hg`, `.svn`. The `.warden/maps` special-case is
+  gone (subsumed by `.warden`). Test fixtures, vendored caches, and
+  build outputs no longer leak into the index.
+
+### Tests
+
+- 9 new tests in `tests/test_v03_fixes.py` covering each bug end-to-end
+  (build → assert).
+- Pre-existing perf-gate test fixed (it read stdout but `# query_ms:`
+  has been on stderr since v0.2.0).
+- Suite now: 62 tests, all passing.
+
 ## [v0.2.1] — 2026-05-06
 
 ### Changed

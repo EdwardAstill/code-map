@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-map"
-version = "0.2.1"
+version = "0.3.0"
 description = "AI-consumable code-map artifact: SQLite + JSONL + token-budgeted markdown for polyglot repos via tree-sitter."
 readme = "README.md"
 license = { text = "MIT" }

@@ -1,4 +1,5 @@
 """Top-level orchestrators for build and refresh."""
+
 from __future__ import annotations
 
 import json
@@ -10,7 +11,6 @@ from pathlib import Path
 from code_map.extract import Edge, Symbol, for_language
 from code_map.manifest import (
     Manifest,
-    derive_repo_slug,
     file_content_hash,
     load_manifest,
     save_manifest,
@@ -29,11 +29,31 @@ _LANG_EXT: dict[str, tuple[str, ...]] = {
     "rust": (".rs",),
 }
 
-_SKIP_DIRS = {".git", "node_modules", ".venv", "target", "__pycache__"}
+_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".warden",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".env",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".next",
+    ".nuxt",
+}
 
 
 def run_build(*, repo: str, languages: tuple[str, ...], map_tokens: int) -> None:
     from code_map.manifest import artifact_root
+
     repo_root = Path(repo).resolve()
     artifact = artifact_root(repo_root)
 
@@ -53,7 +73,9 @@ def run_build(*, repo: str, languages: tuple[str, ...], map_tokens: int) -> None
         conn.close()
 
 
-def _build_inner(conn, repo_root: Path, languages: tuple[str, ...], artifact: Path, map_tokens: int) -> None:
+def _build_inner(
+    conn, repo_root: Path, languages: tuple[str, ...], artifact: Path, map_tokens: int
+) -> None:
     files_indexed: dict[str, dict[str, str]] = {}
     grammar_versions = _grammar_versions(languages)
 
@@ -78,6 +100,32 @@ def _build_inner(conn, repo_root: Path, languages: tuple[str, ...], artifact: Pa
             (rel, lang, h, loc, None, now),
         )
         files_indexed[rel] = {"content_hash": h, "last_indexed": now}
+
+        # Synthesize a `<module>` symbol for every file. Module-level edges
+        # (`import os`, `from pkg import sub` where `sub` is a submodule)
+        # use target_name="<module>"; without this row, all such edges would
+        # be silently dropped during resolution. Spans the whole file so
+        # `code-map context <file>:<line>` still falls through to it when
+        # no inner symbol claims the line.
+        sym_id += 1
+        conn.execute(
+            "INSERT INTO symbols"
+            " (id, file_path, kind, name, qualified_name, line_start, line_end, signature)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (sym_id, rel, "module", "<module>", f"{rel}:<module>", 1, max(1, loc), ""),
+        )
+        sym_lookup[(rel, "<module>")] = sym_id
+        persisted_symbols.append(
+            Symbol(
+                file_path=rel,
+                kind="module",
+                name="<module>",
+                qualified_name=f"{rel}:<module>",
+                line_start=1,
+                line_end=max(1, loc),
+                signature="",
+            )
+        )
 
         ex = for_language(lang)
         try:
@@ -105,7 +153,16 @@ def _build_inner(conn, repo_root: Path, languages: tuple[str, ...], artifact: Pa
                 "INSERT INTO symbols"
                 " (id, file_path, kind, name, qualified_name, line_start, line_end, signature)"
                 " VALUES (?,?,?,?,?,?,?,?)",
-                (sym_id, sym_rel, s.kind, s.name, s.qualified_name, s.line_start, s.line_end, s.signature),
+                (
+                    sym_id,
+                    sym_rel,
+                    s.kind,
+                    s.name,
+                    s.qualified_name,
+                    s.line_start,
+                    s.line_end,
+                    s.signature,
+                ),
             )
             sym_lookup[(sym_rel, s.name)] = sym_id
             # Append to mirror only after the INSERT succeeds — if the INSERT
@@ -125,7 +182,9 @@ def _build_inner(conn, repo_root: Path, languages: tuple[str, ...], artifact: Pa
 
         for e in result_edges:
             src_rel = _rel_path(e.source_file, repo_root)
-            tgt_rel = _rel_path(e.target_file, repo_root) if e.target_file else e.target_file
+            tgt_rel = (
+                _rel_path(e.target_file, repo_root) if e.target_file else e.target_file
+            )
             pending_edges.append(
                 Edge(
                     source_file=src_rel,
@@ -140,19 +199,56 @@ def _build_inner(conn, repo_root: Path, languages: tuple[str, ...], artifact: Pa
             if e.kind == "import" and tgt_rel:
                 file_imports.append((src_rel, tgt_rel))
 
+    # Build a name-only secondary index for cross-file class/type lookups.
+    # Used by inherits/implements when the extractor doesn't know which file
+    # defines the base — we accept the unique cross-file match as `probable`.
+    by_name: dict[str, list[tuple[str, int]]] = {}
+    for (fp, name), sid in sym_lookup.items():
+        by_name.setdefault(name, []).append((fp, sid))
+
     # Resolve edges to symbol IDs and persist.
     persisted_edges: list[Edge] = []
     for e in pending_edges:
         src_id = sym_lookup.get((e.source_file, e.source_name))
-        tgt_id = sym_lookup.get((e.target_file, e.target_name))
+        tgt_id = (
+            sym_lookup.get((e.target_file, e.target_name)) if e.target_file else None
+        )
+        certainty = e.certainty
+
+        # Name-only fallback for inherits/implements/references: extractors
+        # may emit these without a resolved target_file because base classes
+        # are typically named, not pathed. Accept the match only when it's
+        # unique across the repo (or unique to the source file). Demote the
+        # certainty to `probable` when this fallback fires.
+        if tgt_id is None and e.kind in ("inherits", "implements", "references"):
+            candidates = by_name.get(e.target_name, [])
+            same_file = [sid for fp, sid in candidates if fp == e.source_file]
+            if len(same_file) == 1:
+                tgt_id = same_file[0]
+            elif len(candidates) == 1:
+                tgt_id = candidates[0][1]
+                if certainty == "definite":
+                    certainty = "probable"
+            # 0 or >1 → drop edge (ambiguous or unknown)
+
         if src_id is None or tgt_id is None:
             continue
         try:
             conn.execute(
                 "INSERT INTO edges (src_symbol, dst_symbol, kind, certainty, source_type) VALUES (?,?,?,?,?)",
-                (src_id, tgt_id, e.kind, e.certainty, e.source_type),
+                (src_id, tgt_id, e.kind, certainty, e.source_type),
             )
-            persisted_edges.append(e)
+            persisted_edges.append(
+                Edge(
+                    source_file=e.source_file,
+                    source_name=e.source_name,
+                    target_file=e.target_file,
+                    target_name=e.target_name,
+                    kind=e.kind,
+                    certainty=certainty,
+                    source_type=e.source_type,
+                )
+            )
         except sqlite3.IntegrityError:
             pass  # duplicate edge
 
@@ -196,20 +292,18 @@ def _rel_path(file_path: str, repo_root: Path) -> str:
 def _iter_files(repo_root: Path, languages: tuple[str, ...]) -> list[tuple[Path, str]]:
     """Walk repo_root and yield (path, language) pairs for each matching source file.
 
-    Skip directories in _SKIP_DIRS and the `.warden/maps` subtree specifically.
+    Any path containing a directory listed in `_SKIP_DIRS` is excluded.  This
+    covers vendor trees (node_modules, target), virtual envs (.venv, venv),
+    build outputs (dist, build), tool caches (__pycache__, .pytest_cache,
+    .mypy_cache, .ruff_cache, .tox), framework caches (.next, .nuxt), VCS
+    (.git, .hg, .svn), and the Warden artifact tree (.warden — covers
+    .warden/maps/* artifacts as well as .warden/specs etc.).
     """
     out: list[tuple[Path, str]] = []
-    warden_maps = repo_root / ".warden" / "maps"
     for lang in languages:
         exts = _LANG_EXT.get(lang, ())
         for ext in exts:
             for p in repo_root.rglob(f"*{ext}"):
-                # Skip the artifact output directory itself.
-                try:
-                    p.relative_to(warden_maps)
-                    continue
-                except ValueError:
-                    pass
                 parts = set(p.relative_to(repo_root).parts)
                 if parts & _SKIP_DIRS:
                     continue
@@ -225,7 +319,9 @@ def _grammar_versions(languages: tuple[str, ...]) -> dict[str, str]:
     """
     out: dict[str, str] = {}
     for lang in languages:
-        pkg_name = "tree_sitter_typescript" if lang == "javascript" else f"tree_sitter_{lang}"
+        pkg_name = (
+            "tree_sitter_typescript" if lang == "javascript" else f"tree_sitter_{lang}"
+        )
         try:
             mod = __import__(pkg_name)
             out[lang] = getattr(mod, "__version__", "unknown")
@@ -249,9 +345,11 @@ def run_refresh(*, paths: str | None, json_summary: bool) -> None:
     candidates = list(_iter_files(repo_root, languages))
     if paths:
         patterns = [p.strip() for p in paths.split(",") if p.strip()]
+
         def _matches(p: Path) -> bool:
             rel = str(p.relative_to(repo_root))
             return any(fnmatch.fnmatch(rel, pat) for pat in patterns)
+
         candidates = [(p, lang) for p, lang in candidates if _matches(p)]
 
     conn = sqlite3.connect(artifact / "graph.db")
@@ -265,13 +363,33 @@ def run_refresh(*, paths: str | None, json_summary: bool) -> None:
         print(json.dumps(summary))
 
 
-def _refresh_inner(conn, repo_root: Path, manifest: Manifest, manifest_path: Path, candidates: list) -> dict:
+def _refresh_inner(
+    conn, repo_root: Path, manifest: Manifest, manifest_path: Path, candidates: list
+) -> dict:
     parsed = 0
     skipped = 0
+    files_removed = 0
     edges_added = 0
     edges_removed = 0
     pagerank_recomputed = False
     start = time.time()
+
+    # GC: any file in the manifest (and DB) that no longer exists on disk
+    # should be removed. Without this, status reports `stale: true` forever.
+    current_paths = {str(p.relative_to(repo_root)) for p, _ in candidates}
+    stale_paths = [p for p in list(manifest.files.keys()) if p not in current_paths]
+    for path in stale_paths:
+        # Count edges that will be cascaded so the summary stays honest.
+        cascaded = conn.execute(
+            "SELECT COUNT(*) FROM edges e JOIN symbols s"
+            " ON e.src_symbol = s.id OR e.dst_symbol = s.id"
+            " WHERE s.file_path = ?",
+            (path,),
+        ).fetchone()[0]
+        conn.execute("DELETE FROM files WHERE path = ?", (path,))
+        manifest.files.pop(path, None)
+        files_removed += 1
+        edges_removed += cascaded
 
     for src_path, lang in candidates:
         rel = str(src_path.relative_to(repo_root))
@@ -312,34 +430,78 @@ def _refresh_inner(conn, repo_root: Path, manifest: Manifest, manifest_path: Pat
             # aborting the entire refresh.
             continue
 
-        sym_lookup_local: dict[tuple[str, str], int] = {}
+        # Synthesize <module> symbol (mirrors _build_inner — see note there).
+        cur_mod = conn.execute(
+            "INSERT INTO symbols (file_path, kind, name, qualified_name, line_start, line_end, signature)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (rel, "module", "<module>", f"{rel}:<module>", 1, max(1, loc), ""),
+        )
+        assert cur_mod.lastrowid is not None
+        sym_lookup_local: dict[tuple[str, str], int] = {
+            (rel, "<module>"): cur_mod.lastrowid
+        }
+
         for s in result.symbols:
             sym_rel = _rel_path(s.file_path, repo_root) if s.file_path else rel
             cur = conn.execute(
                 "INSERT INTO symbols (file_path, kind, name, qualified_name, line_start, line_end, signature)"
                 " VALUES (?,?,?,?,?,?,?)",
-                (sym_rel, s.kind, s.name, s.qualified_name, s.line_start, s.line_end, s.signature),
+                (
+                    sym_rel,
+                    s.kind,
+                    s.name,
+                    s.qualified_name,
+                    s.line_start,
+                    s.line_end,
+                    s.signature,
+                ),
             )
-            assert cur.lastrowid is not None  # INTEGER PRIMARY KEY always sets lastrowid
+            assert (
+                cur.lastrowid is not None
+            )  # INTEGER PRIMARY KEY always sets lastrowid
             sym_lookup_local[(sym_rel, s.name)] = cur.lastrowid
 
         for e in result.edges:
             src_rel = _rel_path(e.source_file, repo_root)
-            tgt_rel = _rel_path(e.target_file, repo_root) if e.target_file else e.target_file
-            src_id = sym_lookup_local.get((src_rel, e.source_name)) or _lookup_sym(conn, src_rel, e.source_name)
-            tgt_id = _lookup_sym(conn, tgt_rel, e.target_name)
+            tgt_rel = (
+                _rel_path(e.target_file, repo_root) if e.target_file else e.target_file
+            )
+            src_id = sym_lookup_local.get((src_rel, e.source_name)) or _lookup_sym(
+                conn, src_rel, e.source_name
+            )
+            tgt_id = _lookup_sym(conn, tgt_rel, e.target_name) if tgt_rel else None
+            certainty = e.certainty
+
+            # Name-only fallback for cross-file inherits/implements/references
+            # (mirrors the build-time fallback in _build_inner).
+            if tgt_id is None and e.kind in ("inherits", "implements", "references"):
+                same_file = conn.execute(
+                    "SELECT id FROM symbols WHERE file_path = ? AND name = ?",
+                    (src_rel, e.target_name),
+                ).fetchall()
+                if len(same_file) == 1:
+                    tgt_id = same_file[0][0]
+                else:
+                    any_file = conn.execute(
+                        "SELECT id FROM symbols WHERE name = ?", (e.target_name,)
+                    ).fetchall()
+                    if len(any_file) == 1:
+                        tgt_id = any_file[0][0]
+                        if certainty == "definite":
+                            certainty = "probable"
+
             if not (src_id and tgt_id):
                 continue
             try:
                 conn.execute(
                     "INSERT INTO edges (src_symbol, dst_symbol, kind, certainty, source_type) VALUES (?,?,?,?,?)",
-                    (src_id, tgt_id, e.kind, e.certainty, e.source_type),
+                    (src_id, tgt_id, e.kind, certainty, e.source_type),
                 )
                 edges_added += 1
             except sqlite3.IntegrityError:
                 pass
 
-    if parsed > 0:
+    if parsed > 0 or files_removed > 0:
         files = [r[0] for r in conn.execute("SELECT path FROM files")]
         imports = [
             (r[0], r[1])
@@ -362,6 +524,7 @@ def _refresh_inner(conn, repo_root: Path, manifest: Manifest, manifest_path: Pat
     return {
         "parsed_files": parsed,
         "skipped_files": skipped,
+        "files_removed": files_removed,
         "edges_added": edges_added,
         "edges_removed": edges_removed,
         "pagerank_recomputed": pagerank_recomputed,
@@ -369,7 +532,9 @@ def _refresh_inner(conn, repo_root: Path, manifest: Manifest, manifest_path: Pat
     }
 
 
-def _lookup_sym(conn: sqlite3.Connection, file_path: str | None, name: str) -> int | None:
+def _lookup_sym(
+    conn: sqlite3.Connection, file_path: str | None, name: str
+) -> int | None:
     if not file_path:
         return None
     row = conn.execute(

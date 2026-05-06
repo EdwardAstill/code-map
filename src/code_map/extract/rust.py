@@ -10,6 +10,7 @@ Edge certainty assignments (per spec §5):
 - Field-expression call (self.method()): probable / dynamic_dispatch
 - use declaration: definite / direct (treated as import edge)
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -44,7 +45,12 @@ class RustExtractor:
         seen_sym: set[tuple[str, int]] = set()
 
         # --- Symbols ---
-        for cap_name in ("symbol.function", "symbol.type", "symbol.method", "symbol.constant"):
+        for cap_name in (
+            "symbol.function",
+            "symbol.type",
+            "symbol.method",
+            "symbol.constant",
+        ):
             for node in captures.get(cap_name, []):
                 kind = cap_name.split(".", 1)[1]  # function | type | method | constant
                 name = node.text.decode()
@@ -83,29 +89,33 @@ class RustExtractor:
             target = _resolve_rust_module(last_segment, source_root, from_file=path)
             if target is None:
                 continue
-            result.edges.append(Edge(
-                source_file=str(path),
-                source_name="<module>",
-                target_file=str(target),
-                target_name="<module>",
-                kind="import",
-                certainty="definite",
-                source_type="direct",
-            ))
+            result.edges.append(
+                Edge(
+                    source_file=str(path),
+                    source_name="<module>",
+                    target_file=str(target),
+                    target_name="<module>",
+                    kind="import",
+                    certainty="definite",
+                    source_type="direct",
+                )
+            )
 
         # --- Edges: direct identifier calls (same-file) ---
         for node in captures.get("call.callee", []):
             name = node.text.decode()
             if name in defined:
-                result.edges.append(Edge(
-                    source_file=str(path),
-                    source_name=_enclosing_fn_name(node),
-                    target_file=str(path),
-                    target_name=name,
-                    kind="calls",
-                    certainty="definite",
-                    source_type="direct",
-                ))
+                result.edges.append(
+                    Edge(
+                        source_file=str(path),
+                        source_name=_enclosing_fn_name(node),
+                        target_file=str(path),
+                        target_name=name,
+                        kind="calls",
+                        certainty="definite",
+                        source_type="direct",
+                    )
+                )
 
         # --- Edges: scoped calls (receiver::method) ---
         # QueryCursor's call.receiver / call.method capture lists can't be
@@ -114,7 +124,65 @@ class RustExtractor:
         # pair captures per call_expression node.
         _emit_call_edges(tree.root_node, path, source_root, result)
 
+        # --- Edges: impl Trait for Type → implements ---
+        _emit_impl_edges(tree.root_node, path, result)
+
         return result
+
+
+def _emit_impl_edges(root, path: Path, result: ExtractResult) -> None:
+    """Emit `implements` edges for every `impl Trait for Type` block.
+
+    Inherent impls (`impl Type { ... }`) have no `trait` field and emit no
+    edge. Cross-file resolution is name-only (see runner._build_inner).
+    """
+
+    def walk(node):
+        if node.type == "impl_item":
+            trait_node = node.child_by_field_name("trait")
+            type_node = node.child_by_field_name("type")
+            if trait_node is not None and type_node is not None:
+                trait_name = _last_ident(trait_node)
+                type_name = _last_ident(type_node)
+                if trait_name and type_name:
+                    result.edges.append(
+                        Edge(
+                            source_file=str(path),
+                            source_name=type_name,
+                            target_file="",
+                            target_name=trait_name,
+                            kind="implements",
+                            certainty="definite",
+                            source_type="direct",
+                        )
+                    )
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+
+
+def _last_ident(node) -> str | None:
+    """Return the rightmost type/identifier text from a Rust type node.
+
+    Handles `Foo`, `pkg::Foo`, `Foo<T>` — returns `Foo` in each case.
+    """
+    if node.type in ("type_identifier", "identifier"):
+        return node.text.decode()
+    if node.type == "scoped_type_identifier":
+        name = node.child_by_field_name("name")
+        if name is not None:
+            return name.text.decode()
+    if node.type == "generic_type":
+        inner = node.child_by_field_name("type")
+        if inner is not None:
+            return _last_ident(inner)
+    # Fallback: walk children for the first type/identifier we find.
+    for child in node.children:
+        result = _last_ident(child)
+        if result:
+            return result
+    return None
 
 
 def _emit_call_edges(
@@ -124,6 +192,7 @@ def _emit_call_edges(
     result: ExtractResult,
 ) -> None:
     """Walk call_expression nodes to emit scoped and field-expression edges."""
+
     def walk(node):
         if node.type == "call_expression":
             fn_node = node.child_by_field_name("function")
@@ -137,30 +206,36 @@ def _emit_call_edges(
                         if path_child.type == "identifier":
                             module_name = path_child.text.decode()
                             fn_name = name_child.text.decode()
-                            target = _resolve_rust_module(module_name, source_root, from_file=path)
+                            target = _resolve_rust_module(
+                                module_name, source_root, from_file=path
+                            )
                             if target is not None:
-                                result.edges.append(Edge(
-                                    source_file=str(path),
-                                    source_name=_enclosing_fn_name(node),
-                                    target_file=str(target),
-                                    target_name=fn_name,
-                                    kind="calls",
-                                    certainty="definite",
-                                    source_type="direct",
-                                ))
+                                result.edges.append(
+                                    Edge(
+                                        source_file=str(path),
+                                        source_name=_enclosing_fn_name(node),
+                                        target_file=str(target),
+                                        target_name=fn_name,
+                                        kind="calls",
+                                        certainty="definite",
+                                        source_type="direct",
+                                    )
+                                )
                 elif fn_node.type == "field_expression":
                     field_child = fn_node.child_by_field_name("field")
                     if field_child is not None:
                         fn_name = field_child.text.decode()
-                        result.edges.append(Edge(
-                            source_file=str(path),
-                            source_name=_enclosing_fn_name(node),
-                            target_file="",
-                            target_name=fn_name,
-                            kind="calls",
-                            certainty="probable",
-                            source_type="dynamic_dispatch",
-                        ))
+                        result.edges.append(
+                            Edge(
+                                source_file=str(path),
+                                source_name=_enclosing_fn_name(node),
+                                target_file="",
+                                target_name=fn_name,
+                                kind="calls",
+                                certainty="probable",
+                                source_type="dynamic_dispatch",
+                            )
+                        )
         for child in node.children:
             walk(child)
 
@@ -208,7 +283,9 @@ def _enclosing_impl_type(node) -> str | None:
     return None
 
 
-def _resolve_rust_module(module_name: str, source_root: Path, *, from_file: Path | None = None) -> Path | None:
+def _resolve_rust_module(
+    module_name: str, source_root: Path, *, from_file: Path | None = None
+) -> Path | None:
     """Resolve a Rust module name to a .rs file.
 
     Search order:

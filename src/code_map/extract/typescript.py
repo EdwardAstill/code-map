@@ -18,11 +18,11 @@ Edge certainty / source_type assignments:
   same-file direct call   → certainty=definite, source_type=direct
   method/attribute call   → certainty=probable,  source_type=dynamic_dispatch
 """
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Callable
 
 import tree_sitter_typescript
 from tree_sitter import Language, Parser, Query, QueryCursor
@@ -103,7 +103,12 @@ class TypeScriptExtractor:
         # ── Symbols ───────────────────────────────────────────────────────────
         seen_sym: set[tuple[str, int]] = set()
 
-        for cap_name in ("symbol.function", "symbol.class", "symbol.method", "symbol.constant"):
+        for cap_name in (
+            "symbol.function",
+            "symbol.class",
+            "symbol.method",
+            "symbol.constant",
+        ):
             for node in captures.get(cap_name, []):
                 kind = cap_name.split(".", 1)[1]
                 name = node.text.decode()
@@ -132,6 +137,9 @@ class TypeScriptExtractor:
                 if kind in ("function", "class"):
                     defined[name] = sym
 
+        # ── Edges: class extends / implements ─────────────────────────────────
+        _emit_heritage_edges(tree.root_node, path, result)
+
         # ── Edges: import statements ──────────────────────────────────────────
         _emit_import_edges(
             tree.root_node, path, source_root, result, captures, path_aliases
@@ -141,15 +149,17 @@ class TypeScriptExtractor:
         for node in captures.get("call.callee", []):
             name = node.text.decode()
             if name in defined:
-                result.edges.append(Edge(
-                    source_file=str(path),
-                    source_name=_enclosing_symbol_name(node),
-                    target_file=str(path),
-                    target_name=name,
-                    kind="calls",
-                    certainty="definite",
-                    source_type="direct",
-                ))
+                result.edges.append(
+                    Edge(
+                        source_file=str(path),
+                        source_name=_enclosing_symbol_name(node),
+                        target_file=str(path),
+                        target_name=name,
+                        kind="calls",
+                        certainty="definite",
+                        source_type="direct",
+                    )
+                )
 
         # ── Edges: method calls via member expression ─────────────────────────
         receiver_nodes = captures.get("call.receiver", [])
@@ -160,6 +170,7 @@ class TypeScriptExtractor:
             # query. If it does, prefer truncation over crashing — but flag
             # via a counter that downstream tests can catch.
             import warnings
+
             warnings.warn(
                 f"call.receiver/call.method length mismatch: "
                 f"{len(receiver_nodes)} vs {len(method_nodes)} in {path}",
@@ -167,20 +178,96 @@ class TypeScriptExtractor:
                 stacklevel=2,
             )
         for _recv_node, meth_node in zip(receiver_nodes, method_nodes):
-            result.edges.append(Edge(
-                source_file=str(path),
-                source_name=_enclosing_symbol_name(meth_node),
-                target_file="",
-                target_name=meth_node.text.decode(),
-                kind="calls",
-                certainty="probable",
-                source_type="dynamic_dispatch",
-            ))
+            result.edges.append(
+                Edge(
+                    source_file=str(path),
+                    source_name=_enclosing_symbol_name(meth_node),
+                    target_file="",
+                    target_name=meth_node.text.decode(),
+                    kind="calls",
+                    certainty="probable",
+                    source_type="dynamic_dispatch",
+                )
+            )
 
         return result
 
 
+# ── Heritage edge emission (extends / implements) ────────────────────────────
+
+
+def _emit_heritage_edges(root, path: Path, result: ExtractResult) -> None:
+    """Emit `inherits` (extends) and `implements` edges for class declarations.
+
+    Walks every class_declaration; inspects its class_heritage child for
+    extends_clause and implements_clause. Cross-file resolution is name-only
+    (see runner._build_inner): target_file is left blank.
+    """
+
+    def walk(node):
+        if node.type == "class_declaration":
+            class_name_node = node.child_by_field_name("name")
+            if class_name_node is not None:
+                class_name = class_name_node.text.decode()
+                for child in node.children:
+                    if child.type == "class_heritage":
+                        for clause in child.children:
+                            if clause.type == "extends_clause":
+                                for name in _heritage_names(clause):
+                                    if name == class_name:
+                                        continue
+                                    result.edges.append(
+                                        Edge(
+                                            source_file=str(path),
+                                            source_name=class_name,
+                                            target_file="",
+                                            target_name=name,
+                                            kind="inherits",
+                                            certainty="definite",
+                                            source_type="direct",
+                                        )
+                                    )
+                            elif clause.type == "implements_clause":
+                                for name in _heritage_names(clause):
+                                    result.edges.append(
+                                        Edge(
+                                            source_file=str(path),
+                                            source_name=class_name,
+                                            target_file="",
+                                            target_name=name,
+                                            kind="implements",
+                                            certainty="definite",
+                                            source_type="direct",
+                                        )
+                                    )
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+
+
+def _heritage_names(clause) -> list[str]:
+    """Yield the rightmost identifier from each name expression in a clause."""
+    out: list[str] = []
+    for child in clause.children:
+        if child.type in ("identifier", "type_identifier"):
+            out.append(child.text.decode())
+        elif child.type == "member_expression":
+            prop = child.child_by_field_name("property")
+            if prop is not None:
+                out.append(prop.text.decode())
+        elif child.type in ("generic_type",):
+            # extends Foo<T>: pick out the underlying name
+            name_child = child.child_by_field_name(
+                "name"
+            ) or _first_named_child_of_types(child, ("identifier", "type_identifier"))
+            if name_child is not None:
+                out.append(name_child.text.decode())
+    return out
+
+
 # ── Import edge emission ──────────────────────────────────────────────────────
+
 
 def _emit_import_edges(
     root,
@@ -196,6 +283,7 @@ def _emit_import_edges(
     ``target_name=greet``.  For bare ``import './side-effect'`` we emit a
     module-level edge with ``target_name='<module>'``.
     """
+
     def walk(node):
         if node.type == "import_statement":
             _process_import_statement(node, path, source_root, result, path_aliases)
@@ -236,26 +324,30 @@ def _process_import_statement(
 
     if named:
         for name in named:
-            result.edges.append(Edge(
+            result.edges.append(
+                Edge(
+                    source_file=str(path),
+                    source_name="<module>",
+                    target_file=str(target),
+                    target_name=name,
+                    kind="import",
+                    certainty="definite",
+                    source_type="direct",
+                )
+            )
+    else:
+        # Bare import or namespace import — module-level edge.
+        result.edges.append(
+            Edge(
                 source_file=str(path),
                 source_name="<module>",
                 target_file=str(target),
-                target_name=name,
+                target_name="<module>",
                 kind="import",
                 certainty="definite",
                 source_type="direct",
-            ))
-    else:
-        # Bare import or namespace import — module-level edge.
-        result.edges.append(Edge(
-            source_file=str(path),
-            source_name="<module>",
-            target_file=str(target),
-            target_name="<module>",
-            kind="import",
-            certainty="definite",
-            source_type="direct",
-        ))
+            )
+        )
 
 
 def _collect_named_imports(import_clause_node, names: list[str]) -> None:
@@ -279,6 +371,7 @@ def _collect_named_imports(import_clause_node, names: list[str]) -> None:
 
 
 # ── Module resolution ─────────────────────────────────────────────────────────
+
 
 def _resolve_ts_import(
     spec: str,
@@ -335,7 +428,7 @@ def _apply_path_aliases(spec: str, aliases: dict[str, str], source_root: Path) -
         if pattern.endswith("/*"):
             prefix = pattern[:-2]  # strip trailing /*
             if spec.startswith(prefix + "/"):
-                suffix = spec[len(prefix) + 1:]
+                suffix = spec[len(prefix) + 1 :]
                 # replacement may also end in /*
                 repl_base = replacement.rstrip("/*").rstrip("/")
                 abs_replacement = (source_root / repl_base / suffix).resolve()
@@ -387,14 +480,18 @@ def _load_tsconfig_paths(source_root: Path) -> dict[str, str]:
 
 # ── AST helpers ───────────────────────────────────────────────────────────────
 
+
 def _enclosing_symbol_name(node) -> str:
     """Walk up to find the enclosing function or class name."""
     cur = node.parent
     while cur is not None:
-        if cur.type in ("function_declaration", "method_definition", "class_declaration"):
-            name_node = (
-                cur.child_by_field_name("name")
-                or _first_named_child_of_types(cur, ("identifier", "property_identifier", "type_identifier"))
+        if cur.type in (
+            "function_declaration",
+            "method_definition",
+            "class_declaration",
+        ):
+            name_node = cur.child_by_field_name("name") or _first_named_child_of_types(
+                cur, ("identifier", "property_identifier", "type_identifier")
             )
             if name_node is not None:
                 return name_node.text.decode()
@@ -409,6 +506,7 @@ def _enclosing_definition(node):
         if cur.type in (
             "function_declaration",
             "class_declaration",
+            "interface_declaration",
             "method_definition",
             "lexical_declaration",
             "variable_declarator",

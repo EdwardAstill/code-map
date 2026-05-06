@@ -101,7 +101,7 @@ def _callers_of(conn: sqlite3.Connection, target: str, *, limit: int | None):
         "JOIN symbols s_dst ON e.dst_symbol = s_dst.id "
         "JOIN symbols s_src ON e.src_symbol = s_src.id "
         "LEFT JOIN files f ON s_src.file_path = f.path "
-        f"WHERE {pred} AND e.kind IN ('calls','references') "
+        f"WHERE {pred} AND e.kind IN ('calls','references','inherits','implements') "
         "ORDER BY score DESC, s_src.qualified_name ASC"
     )
     if limit is not None:
@@ -118,7 +118,7 @@ def _callees_of(conn: sqlite3.Connection, target: str, *, limit: int | None):
         "JOIN symbols s_src ON e.src_symbol = s_src.id "
         "JOIN symbols s_dst ON e.dst_symbol = s_dst.id "
         "LEFT JOIN files f ON s_dst.file_path = f.path "
-        f"WHERE {pred} AND e.kind IN ('calls','references') "
+        f"WHERE {pred} AND e.kind IN ('calls','references','inherits','implements') "
         "ORDER BY score DESC, s_dst.qualified_name ASC"
     )
     if limit is not None:
@@ -134,7 +134,7 @@ def _blast_radius(conn: sqlite3.Connection, target: str, *, depth: int, limit: i
       UNION
       SELECT e.src_symbol, c.depth + 1
       FROM edges e JOIN callers c ON e.dst_symbol = c.id
-      WHERE c.depth < ? AND e.kind IN ('calls','references')
+      WHERE c.depth < ? AND e.kind IN ('calls','references','inherits','implements')
     )
     SELECT s.qualified_name, s.name, s.kind, c.depth,
            (COALESCE(f.pagerank, 0.0) / (1.0 + c.depth)) AS score

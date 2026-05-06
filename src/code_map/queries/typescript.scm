@@ -12,6 +12,8 @@
 
 (class_declaration name: (type_identifier) @symbol.class)
 
+(interface_declaration name: (type_identifier) @symbol.class)
+
 (method_definition name: (property_identifier) @symbol.method)
 
 (export_statement

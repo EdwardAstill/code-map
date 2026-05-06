@@ -35,7 +35,7 @@ def render_map_md(*, conn: sqlite3.Connection, out_path: Path, map_tokens: int) 
     last_built = conn.execute("SELECT MAX(last_indexed) FROM files").fetchone()[0] or ""
 
     header_lines = [
-        f"# Code Map",
+        "# Code Map",
         "",
         f"- files: {len(files)}",
         f"- symbols: {sym_count}",
